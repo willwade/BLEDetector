@@ -2,13 +2,16 @@
 import asyncio
 import time
 from pathlib import Path
+from dataclasses import dataclass, field
 
 from bleak import BleakScanner
 
 
 MAPPING_FILE = "device_mappings.txt"
-SCAN_INTERVAL = 5        # seconds between scans
-RELOAD_INTERVAL = 5      # seconds between mapping reloads
+PRINT_INTERVAL = 5      # how often to print the table (seconds)
+RELOAD_INTERVAL = 5     # how often to reload mappings (seconds)
+STALE_AFTER = 30        # hide devices not seen for this many seconds
+
 
 def load_device_mappings(path: str = MAPPING_FILE) -> dict:
     """
@@ -43,88 +46,178 @@ def load_device_mappings(path: str = MAPPING_FILE) -> dict:
     return mapping
 
 
+@dataclass
+class SeenDevice:
+    addr: str
+    name: str
+    rssi: int | None = None
+    last_seen: float = field(default_factory=time.time)
 
-async def continuous_scan(
-    mapping_path: str = MAPPING_FILE,
-    scan_interval: int = SCAN_INTERVAL,
-    reload_interval: int = RELOAD_INTERVAL,
-):
-    device_map = load_device_mappings(mapping_path)
-    last_reload = time.time()
 
-    print("[INFO] Initial mappings:")
-    if device_map:
-        for ident, name in device_map.items():
-            print(f"  {ident} -> {name}")
-    else:
-        print("  (none yet)")
-    print()
+class DeviceTracker:
+    def __init__(self, mapping_path: str = MAPPING_FILE):
+        self.mapping_path = mapping_path
+        self.mapping = load_device_mappings(mapping_path)
+        self.last_reload = time.time()
+        self.devices: dict[str, SeenDevice] = {}
+
+        print("[INFO] Initial mappings:")
+        if self.mapping:
+            for ident, name in self.mapping.items():
+                print(f"  {ident} -> {name}")
+        else:
+            print("  (none yet)")
+        print()
+
+    def maybe_reload_mapping(self):
+        now = time.time()
+        if now - self.last_reload >= RELOAD_INTERVAL:
+            new_map = load_device_mappings(self.mapping_path)
+            if new_map != self.mapping:
+                print("\n[INFO] Device mappings updated:")
+                for ident, name in new_map.items():
+                    print(f"  {ident} -> {name}")
+                print()
+                self.mapping = new_map
+            self.last_reload = now
+
+    def detection_callback(self, device, advertisement_data):
+        """Called by Bleak every time an advertisement is seen."""
+        addr = device.address or ""
+        name = device.name or "N/A"
+        rssi = advertisement_data.rssi  # <- this is the good bit on macOS
+
+        key = addr or name  # use address if present, else name
+        now = time.time()
+
+        existing = self.devices.get(key)
+        if existing:
+            existing.rssi = rssi
+            existing.name = name
+            existing.last_seen = now
+        else:
+            self.devices[key] = SeenDevice(addr=addr, name=name, rssi=rssi, last_seen=now)
+
+    def _friendly_name(self, dev: SeenDevice) -> str | None:
+        # Match by address OR by name (case-insensitive)
+        addr_key = (dev.addr or "").upper()
+        name_key = dev.name.strip().upper() if dev.name else ""
+
+        return self.mapping.get(addr_key) or self.mapping.get(name_key)
+
+    def print_OLD_table(self):
+        now = time.time()
+
+        # Drop stale devices
+        self.devices = {
+            k: v for k, v in self.devices.items()
+            if now - v.last_seen <= STALE_AFTER
+        }
+
+        if not self.devices:
+            print("[INFO] No recent devices.\n")
+            return
+
+        print("[INFO] Recently seen devices (last ~30s):")
+        print("-" * 80)
+        print(f"{'KNOWN?':<8} {'Friendly':<20} {'RSSI':<6} {'Name':<20} {'ID':<20}")
+        print("-" * 80)
+
+        for dev in self.devices.values():
+            friendly = self._friendly_name(dev)
+            known = "YES" if friendly else "NO"
+            label = friendly or ""
+            rssi_str = str(dev.rssi) if dev.rssi is not None else "N/A"
+            print(
+                f"{known:<8} {label:<20} {rssi_str:<6} "
+                f"{dev.name:<20} {dev.addr:<20}"
+            )
+
+        print("-" * 80)
+        print()
+
+    def print_table(self):
+        now = time.time()
+
+        # Drop stale devices
+        self.devices = {
+            k: v for k, v in self.devices.items()
+            if now - v.last_seen <= STALE_AFTER
+        }
+
+        if not self.devices:
+            print("[INFO] No recent devices.\n")
+            return
+
+        print("[INFO] Recently seen devices (last ~30s):")
+
+        # -------- SORTING --------
+        # Split into known and unknown devices
+        known = []
+        unknown = []
+
+        for dev in self.devices.values():
+            friendly = self._friendly_name(dev)
+            if friendly:
+                known.append((friendly, dev))
+            else:
+                unknown.append(dev)
+
+        # Sort known devices by RSSI (higher is closer)
+        known.sort(key=lambda kv: (kv[1].rssi if kv[1].rssi is not None else -999), reverse=True)
+
+        # Sort unknown devices by RSSI too (optional)
+        unknown.sort(key=lambda d: (d.rssi if d.rssi is not None else -999), reverse=True)
+
+        # -------- PRINTING --------
+        print("-" * 80)
+        print("KNOWN DEVICES (closest first)")
+        print("-" * 80)
+        print(f"{'Friendly':<20} {'RSSI':<6} {'Name':<20} {'ID':<20}")
+        print("-" * 80)
+        for friendly, dev in known:
+            rssi_str = str(dev.rssi) if dev.rssi is not None else "N/A"
+            print(f"{friendly:<20} {rssi_str:<6} {dev.name:<20} {dev.addr:<20}")
+        if not known:
+            print("(none)")
+        print()
+
+        print("-" * 80)
+        print("UNKNOWN DEVICES")
+        print("-" * 80)
+        print(f"{'RSSI':<6} {'Name':<20} {'ID':<20}")
+        print("-" * 80)
+        for dev in unknown:
+            rssi_str = str(dev.rssi) if dev.rssi is not None else "N/A"
+            print(f"{rssi_str:<6} {dev.name:<20} {dev.addr:<20}")
+        if not unknown:
+            print("(none)")
+        print()
+
+        print("-" * 80)
+        print()
+
+
+
+async def main():
+    tracker = DeviceTracker(MAPPING_FILE)
+
+    scanner = BleakScanner(detection_callback=tracker.detection_callback)
+
+    await scanner.start()
+    print("[INFO] Scanner started. Press Ctrl+C to stop.\n")
 
     try:
         while True:
-            now = time.time()
-
-            # --- Reload mapping file periodically ---
-            if now - last_reload >= reload_interval:
-                new_map = load_device_mappings(mapping_path)
-                if new_map != device_map:
-                    print("\n[INFO] Device mappings updated:")
-                    for ident, name in new_map.items():
-                        print(f"  {ident} -> {name}")
-                    print()
-                    device_map = new_map
-                last_reload = now
-
-            print("[INFO] Scanning for BLE devices...")
-            devices = await BleakScanner.discover(timeout=scan_interval)
-
-            if not devices:
-                print("  No devices found.\n")
-            else:
-                for d in devices:
-                    addr = d.address or ""
-                    name_raw = d.name or "N/A"
-
-                    # Normalised keys
-                    addr_key = addr.upper()
-                    name_key = name_raw.strip().upper()
-
-                    # Try mapping by address OR by name
-                    friendly = (
-                        device_map.get(addr_key)
-                        or device_map.get(name_key)
-                    )
-
-                    # RSSI still best-effort (macOS often won't give it)
-                    rssi = None
-                    if hasattr(d, "rssi"):
-                        rssi = d.rssi
-                    elif hasattr(d, "metadata") and isinstance(d.metadata, dict):
-                        rssi = d.metadata.get("rssi")
-                    rssi_str = str(rssi) if rssi is not None else "N/A"
-
-                    if friendly:
-                        print(
-                            f"[KNOWN]   {friendly:<20} | RSSI {rssi_str:>4} "
-                            f"| Name={name_raw:<15} | ID={addr}"
-                        )
-                    else:
-                        print(
-                            f"[UNKNOWN] Name={name_raw:<15} | RSSI {rssi_str:>4} "
-                            f"| ID={addr}"
-                        )
-                print()
-
-            await asyncio.sleep(0.1)
-
+            tracker.maybe_reload_mapping()
+            tracker.print_table()
+            await asyncio.sleep(PRINT_INTERVAL)
     except KeyboardInterrupt:
-        print("\n[INFO] Stopped by user (Ctrl+C).")
+        print("\n[INFO] Stopping scanner...")
+    finally:
+        await scanner.stop()
+        print("[INFO] Scanner stopped.")
+
 
 if __name__ == "__main__":
-    asyncio.run(
-        continuous_scan(
-            mapping_path=MAPPING_FILE,
-            scan_interval=SCAN_INTERVAL,
-            reload_interval=RELOAD_INTERVAL,
-        )
-    )
+    asyncio.run(main())
