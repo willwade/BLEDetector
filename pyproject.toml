@@ -1,0 +1,11 @@
+[project]
+name = "ble-presence-scanner"
+version = "0.1.0"
+description = "BLE presence detection with auto-updating device name mappings."
+readme = "README.md"
+authors = [{ name = "Will Wade" }]
+requires-python = ">=3.9"
+
+dependencies = [
+    "bleak>=0.22.0",
+]

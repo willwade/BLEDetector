@@ -1,0 +1,4 @@
+# device_mappings.txt
+iPhone iWill = Will
+Boyd-TV      = Living Room TV
+LE_WH-1000XM5 = Headphones
