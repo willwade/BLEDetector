@@ -197,6 +197,28 @@ class DeviceTracker:
         print("-" * 80)
         print()
 
+import math
+
+def estimate_distance(rssi: int, tx_power: int = -59, path_loss_exponent: float = 2.0) -> float:
+    """
+    Estimate distance (in meters) from RSSI and tx power at 1 m.
+    This is an approximate model; expect large error in many real-world environments.
+    
+    Arguments:
+        rssi: Measured RSSI in dBm (negative value).
+        tx_power: RSSI in dBm at 1 meter distance (negative value).
+        path_loss_exponent: n, the environment path loss exponent (2.0 = free space,
+                             3-4 = indoor with walls).
+    
+    Returns:
+        Estimated distance in meters.
+    """
+    if rssi == 0:
+        return float('inf')  # Unknown/invalid
+    ratio_db = tx_power - rssi
+    distance = 10 ** (ratio_db / (10 * path_loss_exponent))
+    return distance
+
 
 
 async def main():
